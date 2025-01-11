@@ -1,0 +1,199 @@
+---
+title: "resident_EU"
+output: html_document
+date: "2025-04-01"
+---
+
+## residential and commercial heating emissions for Zurich
+
+```{r setup, include=FALSE}
+rm(list = ls()) # delete all environment data
+getwd()         # check your working directory
+for (pkg in c("terra", "tidyverse", "osmdata", "randomForest")) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+```
+
+```{r}
+
+# ========== 1) INITIAL SETUP ==========
+name_vec       <- "ZH"
+target_crs     <- "2056"
+target_res     <- 30
+pop_string     <- paste0("../Data/Pop_Density_", target_crs, ".tif")
+pop_wr_string  <- paste0("../Data/", name_vec, "/pop.tif")
+LU_string      <- paste0("../Data/", name_vec, "/res_ind_raster_30m.tif")
+city_string    <- paste0("../Data/", name_vec, "/polygon.shp")
+
+# Single-cell total heating emissions
+total_heating_emissions <- 895867.01  # tons CO2
+
+# ========== 2) LOAD LANDCOVER & CREATE SINGLE-CELL GID ==========
+landcover <- rast(LU_string)  # 30 m resolution
+city_mask <- vect(city_string)
+
+city_extent <- ext(city_mask)  # bounding box for the city
+gid <- rast(nrow = 1, ncol = 1, extent = city_extent, crs = crs(city_mask))
+# gid <- rast(nrow=10, ncol=10, extent=city_extent, crs=crs(city_mask))
+# values(gid) <- total_heating_emissions / 100  # spread total city emissions across 100 coarse cells
+values(gid) <- total_heating_emissions
+
+# ========== 3) LOAD & PREP POPULATION RASTER ==========
+fill_pop <- rast(pop_string)
+fill_pop[is.na(fill_pop)] <- 0
+
+# Crop to match landcover extent (original approach)
+gid      <- crop(gid, landcover)
+fill_pop <- crop(fill_pop, landcover)
+
+# Align extents
+ext(gid)      <- ext(landcover)
+ext(fill_pop) <- ext(landcover)
+
+# Quick checks
+plot((gid + 0.1), main = "Log of Single-Cell GID")
+plot((fill_pop + 0.1), main = "Log of Population")
+plot(landcover, main="Landcover")
+
+cat("Sum of GID:",        global(gid,      "sum", na.rm=TRUE)[[1]], "\n")
+cat("Sum of Population:", global(fill_pop, "sum", na.rm=TRUE)[[1]], "\n")
+
+# ========== 4) BUILD COARSE GID AT ~1 KM BY RESAMPLING ON POP GRID ==========
+# If 'fill_pop' is ~1 km, res(pop) should be near (1000, 1000).
+# We treat the single cell as if it was 1 cell per 1 km^2 area.
+
+pop <- fill_pop # rename for clarity
+
+# Use nearest neighbor for discrete/categorical data
+gid_1000 <- resample(gid, pop, method = "bilinear")
+
+# Adjust GID if the coarse cell is bigger or smaller
+resolution_ratio <- (res(gid)[1] / res(pop)[1])^2
+gid_1000 <- gid_1000 / resolution_ratio
+
+# ========== 5) DISAGGREGATE POPULATION TO 30 M ==========
+fact_30m <- floor(1000 / target_res)      # e.g., 1000/30 = 33
+pop_disaggregated <- disagg(pop, fact = fact_30m, method = "bilinear")
+
+# Then divide by area factor to preserve the sum
+pop_disaggregated <- pop_disaggregated / (1000 / target_res)^2
+
+# Optional: Save disaggregated population
+writeRaster(pop_disaggregated, pop_wr_string, overwrite = TRUE)
+
+# ========== 6) DISAGGREGATE GID TO 30 M ==========
+gid_disaggregated <- disagg(gid_1000, fact = fact_30m, method = "bilinear")
+gid_disaggregated <- gid_disaggregated / (1000 / target_res)^2
+
+new_sum <- global(gid_disaggregated, "sum", na.rm = TRUE)[[1]]
+corr_factor <- 895867 / new_sum
+gid_disaggregated <- gid_disaggregated * corr_factor
+
+# Suppose 'gid_disaggregated' is uniform
+# Add some noise
+set.seed(123)  # For reproducibility
+noise <- rast(gid_disaggregated)  # Create a raster with the same dimensions
+values(noise) <- runif(ncell(noise), min = -1e-3, max = 1e-3)
+
+# Add the noise to gid_disaggregated
+gid_disaggregated <- gid_disaggregated + noise
+
+
+# ========== 7) CHECK RESULTS ==========
+plot((pop_disaggregated), main = "Log-scaled Disaggregated Population")
+plot((gid_disaggregated), main = "Log-scaled Disaggregated GID")
+
+global_pop_sum <- global(pop_disaggregated, "sum", na.rm = TRUE)
+global_gid_sum <- global(gid_disaggregated, "sum", na.rm = TRUE)
+
+cat("Disaggregated POP sum:", global_pop_sum[[1]], "\n")
+cat("Disaggregated GID sum:", global_gid_sum[[1]], "\n")
+```
+
+```{r}
+landres
+```
+```{r}
+# -------------------- Section 3: LAND COVER & MODEL SETUP --------------------
+
+# 1. Convert landcover classes to building density or weighting
+landres <- landcover
+
+# Example recodes: 
+#  - 11100 => 0.9
+#  - 11210 => 0.65
+#  - 11220 => 0.4
+#  - 11230 => 0.2
+#  - 11240 => 0.05
+#  - 11300 => 0.01
+#  - 12100 => 1
+# Adjust these to match your real definitions
+values(landres)[values(landres) == 11100] <- 0.9
+values(landres)[values(landres) == 11210] <- 0.65
+values(landres)[values(landres) == 11220] <- 0.4
+values(landres)[values(landres) == 11230] <- 0.2
+values(landres)[values(landres) == 11240] <- 0.05
+values(landres)[values(landres) == 11300] <- 0.01
+values(landres)[values(landres) == 12100] <- 1
+
+# 2. Resample landres to match pop_disaggregated resolution & extent
+#    Use "near" for discrete landcover codes or building densities
+landres_nor <- resample(landres, pop_disaggregated, method = "near")
+
+# 3. Prepare data frames for modeling
+gid_values     <- as.data.frame(gid_disaggregated, xy = FALSE)  # emission
+landres_values <- as.data.frame(landres_nor,        xy = FALSE) # building "density"
+pop_values     <- as.data.frame(pop_disaggregated,  xy = FALSE) # population
+
+data <- cbind(gid_values, landres_values, pop_values)
+colnames(data) <- c("emission", "building", "population")
+data <- na.omit(data)
+
+# 4. (Optional) Clear some big objects from memory
+rm(gid, fill_pop, landcover, landres, pop_string)
+```
+
+```{r}
+# -------------------- Section 4: MODELING WITH RANDOM FOREST --------------------
+
+# 1. Sample a fraction of rows to speed up training
+df_rf <- data[sample(nrow(data), floor(nrow(data)/10)), ]
+
+# 2. Fit Random Forest: emission ~ building + population
+model.rf <- randomForest(emission ~ building + population, data = df_rf)
+
+# 3. Predict over the full dataset
+variables <- data[, c("building","population")]
+pred <- predict(model.rf, variables)
+
+# 4. Rebuild the predicted raster
+result <- rast(
+  matrix(pred, ncol = ncol(landres_nor), byrow = TRUE),
+  ext = ext(landres_nor),
+  crs = crs(landres_nor)
+)
+
+plot(result, main="Predicted Heating Emissions (Random Forest)")
+cat("Sum of predicted emissions:", global(result, "sum", na.rm = TRUE)[[1]], "\n")
+```
+
+```{r}
+# -------------------- Section 5: MASK/CROP TO CITY & SAVE --------------------
+
+# 1. Crop to city
+result_cropped <- crop(result, city_mask)
+
+# 2. Mask outside city boundary to NA or 0 (your choice)
+#    If you want outside area = 0, do: updatevalue = 0
+#    If you want outside area = NA, do: updatevalue = NA
+result_cropped <- mask(result_cropped, city_mask, updatevalue = NA)
+plot(result_cropped, main="Predicted Emissions (Within City)")
+
+cat("Sum within city mask:", global(result_cropped, "sum", na.rm = TRUE), "\n")
+
+# 3. Write final raster
+writeRaster(result_cropped, res_string, overwrite = TRUE)
+print(name_vec)
+```
+
+
