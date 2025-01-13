@@ -1,0 +1,284 @@
+---
+title: "resident_EU"
+output: html_document
+date: "2023-06-11"
+---
+
+## residential emissions for EU
+
+```{r}
+rm(list = ls())# delete all environmental data
+getwd()  #EDIT TO YOUR WORKING DIRECTORY. If you use my file structure and naming conventions
+#within your WD, you shouldn't need to edit any other file names
+
+# Load packages
+for (pkg in c("terra", "tidyverse", "osmdata", "randomForest", "viridis")) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+```
+
+```{r}
+name_vec <- "ZH"
+target_crs <- "2056"
+target_res <- 30                 # target resolution in meters (for final output)
+target_res_str <- "30"
+
+pop_string <- paste("../Data/Pop_Density_",target_crs,".tif", sep="", collapse="")
+pop_wr_string <- paste("../Data/",name_vec,"/pop.tif", sep="", collapse = "")
+
+# pop_string <- paste("../Data/",name_vec,"/pop.tif", sep="", collapse = "")
+# pop_wr_string <- paste("../Data/",name_vec,"/pop100.tif", sep="", collapse = "")
+
+c_res_string <- paste("../Data/GID/res_",target_crs,".tif", sep="", collapse="")
+c_ind_string <- paste("../Data/GID/ind_",target_crs,".tif", sep="", collapse="")
+LU_string <- paste("../Data/",name_vec,"/res_ind_raster_",target_res_str,"m_full.tif", sep="", collapse = "")
+city_string <- paste("../Data/",name_vec,"/polygon.shp", sep = "", collapse="")
+
+res_string <- paste("../Results/",name_vec,"/res_ind_high_res.tif", sep="", collapse = "")
+
+
+```
+
+
+```{r}
+# Load GID and landcover rasters
+# We adjust the emissions for the factor that we know is in the city of zurich
+gid_res <- rast(c_res_string)          # GID raster (e.g., 10 km resolution) 
+gid_ind <- rast(c_ind_string)
+
+# Add ind and res raster
+gid <- gid_res + gid_ind
+
+landcover <- rast(LU_string)   # Landcover raster (e.g., 30 m resolution)
+
+city_mask = vect(city_string)
+
+# Load population raster and preprocess
+fill_pop <- rast(pop_string)  # Load population raster
+fill_pop[is.na(fill_pop)] <- 0  # Replace NA values with 0
+
+
+# Inspect the CRS and align if necessary
+# Align CRS
+# if (!compareCRS(gid, fill_pop) || !compareCRS(gid, landcover)) {
+#   stop("CRS of input rasters do not match. Ensure they are all in CRS 2056.")
+# }
+
+# Crop datasets to the extent of the landcover raster
+gid <- crop(gid, landcover)          # Crop original GID raster
+fill_pop <- crop(fill_pop, landcover)
+
+# Align the extents of GID and landcover raster
+ext(gid) <- ext(landcover)
+ext(fill_pop) <- ext(landcover)
+
+# 1) Define the template using your landcover's extent & crs
+template_30m <- rast(
+  ext      = ext(landcover),  # or ext(city_mask) if you prefer that bounding
+  resolution = 30,            # exactly 30m
+  crs     = crs(landcover)    # or "EPSG:2056", ensuring it's in meters
+)
+
+
+# Plot the cropped GID rasters
+plot(gid, main = "GID (Original CRS)", axes = FALSE, box = FALSE)
+plot(mask(fill_pop, city_mask, updatevalue = NA), main = "Log of Pop GID", axes = FALSE, box = FALSE)
+plot(mask(landcover, city_mask, updatevalue = NA),  main = "Landcover Raster", axes = FALSE, box = FALSE)
+
+# Summarize global sums to check the impact of transformations
+print(global(gid, "sum", na.rm = TRUE))  # Sum of population raster
+print(global(fill_pop, "sum", na.rm = TRUE))  # Sum of cropped original GID raster
+
+```
+
+```{r}
+pop <- fill_pop
+
+#--- Create 30 m rasters and preserve sums ---
+# Population at ~1km -> 30m
+pop_disaggregated <- resample(pop, template_30m, method = "bilinear")
+pop_ratio <- global(pop, "sum", na.rm = TRUE)[[1]] / global(pop_disaggregated, "sum", na.rm = TRUE)[[1]]
+pop_disaggregated <- pop_disaggregated * pop_ratio
+writeRaster(pop_disaggregated, pop_wr_string, overwrite = TRUE)
+
+# GID -> 30m
+gid_disaggregated <- resample(gid, template_30m, method = "near")
+gid_ratio <- global(gid, "sum", na.rm = TRUE)[[1]] / global(gid_disaggregated, "sum", na.rm = TRUE)[[1]]
+gid_disaggregated <- gid_disaggregated * gid_ratio
+
+#--- Quick checks ---
+
+plot((pop_disaggregated), main = "Log-scaled Disaggregated Population")
+plot((gid_disaggregated), main = "Log-scaled Disaggregated GID")
+
+global_pop_sum <- global(pop_disaggregated, "sum", na.rm = TRUE)
+global_gid_sum <- global(gid_disaggregated, "sum", na.rm = TRUE)
+print(global_pop_sum)
+print(global_gid_sum)
+
+res(pop_disaggregated)
+```
+
+<!-- ```{r} -->
+<!-- pop <- fill_pop                  # population raster @ ~1 km -->
+<!-- fact_30m <- floor(1000 / target_res)   -->
+
+<!-- # Use nearest-neighbor ("ngb"/"near") for discrete or categorical data (e.g., emissions by cell). -->
+<!-- gid_1000 <- resample(gid, fill_pop, method = "near") -->
+
+<!-- # Adjust GID values based on the resolution ratio -->
+<!-- resolution_ratio <- (res(gid)[1] / res(pop)[1])^2 -->
+<!-- gid_1000 <- gid_1000 / resolution_ratio -->
+
+
+<!-- # Disaggregate population raster to target resolution (30 m x 30 m) -->
+<!-- pop_disaggregated <- disagg(pop, fact = fact_30m, method = "bilinear") -->
+<!-- pop_disaggregated <- pop_disaggregated / (1000 / target_res)^2 -->
+
+<!-- # Save the disaggregated population raster -->
+<!-- writeRaster(pop_disaggregated, pop_wr_string, overwrite = TRUE) -->
+
+<!-- # Disaggregate GID raster to target resolution (30 m x 30 m) -->
+<!-- gid_disaggregated <- disagg(gid_1000, fact = fact_30m, method = "bilinear") -->
+<!-- gid_disaggregated <- gid_disaggregated / (1000 / target_res)^2 -->
+
+<!-- # --- Check results ---- -->
+<!-- # Plot results for visual verification -->
+<!-- plot(log1p(pop_disaggregated), main = "Log-scaled Disaggregated Population") -->
+<!-- plot(log1p(gid_disaggregated), main = "Log-scaled Disaggregated GID") -->
+
+<!-- # Validate global sums to ensure data consistency -->
+<!-- global_pop_sum <- global(pop_disaggregated, "sum", na.rm = TRUE) -->
+<!-- global_gid_sum <- global(gid_disaggregated, "sum", na.rm = TRUE) -->
+
+<!-- print(global_pop_sum) -->
+<!-- print(global_gid_sum) -->
+
+<!-- res(pop_disaggregated) -->
+<!-- ``` -->
+
+```{r}
+# Per capita result (value - 0-1500)
+# gid_20_pc <- gid_20/pop_20
+
+
+# Residential land use
+landres <- landcover
+head(landres)
+#values(landres)[values(landres) > 2] = NA
+
+# Emission for residential, consider density
+#values(landres)[values(landres) == 1] = 1                                    #@CONG: Maybe we need to discuss these densities since the new LU data has updated codes
+values(landres)[values(landres) == 12100] = 2
+values(landres)[values(landres) == 11100] = 0.9
+values(landres)[values(landres) == 11210] = 0.65
+values(landres)[values(landres) == 11220] = 0.4
+values(landres)[values(landres) == 11230] = 0.2
+values(landres)[values(landres) == 11240] = 0.05
+values(landres)[values(landres) == 11300] = 0.01
+
+# Align residential land use
+landres_nor <- resample(landres, pop_disaggregated, method = "near")
+
+# Create industry binary raster 
+landind <- landcover
+
+values(landind)[values(landind) != 12100] = 0
+values(landind)[values(landind) == 12100] = 1
+
+# Resample to match your population grid (pop_disaggregated)
+landind_nor <- resample(landind, pop_disaggregated, method = "near")
+
+
+# Regression, with population and building density as independent variables--------
+gid_values <- as.numeric(as.matrix(gid_disaggregated))
+landres_values <- as.numeric(as.matrix(landres_nor))
+scaled_pop_values <- as.numeric(as.matrix(pop_disaggregated)) 
+landind_values  <- as.numeric(as.matrix(landind_nor))
+
+# Combine into a data frame
+data <- data.frame(
+  emission = gid_values,
+  building = landres_values,
+  industrial = landind_values,
+  population = scaled_pop_values
+)
+
+colnames(data) <- c("emission", "building", "industrial", "population")
+
+# 2. Force "no building = no emission"
+threshold <- 0.001  # Define what constitutes "no building"
+data$emission[data$building < threshold] <- 0
+
+df <- na.omit(data)
+
+```
+
+```{r}
+rm(gid, landres, landind, pop)
+
+# Linear
+# model <- lm(emission ~ building + population, data = df_rf)
+variables <- data[, c("building", "industrial", "population")]
+ # variables <- data[,c(2,4)]
+ # variables <- data.frame(building = data[, 2])
+# pred <- predict(model, variables)
+# result <- raster(matrix(pred, ncol = landres_nor@ncols, byrow = TRUE))
+# extent(result) <- extent(landres_nor)
+# crs(result) <- crs(landres_nor)
+# plot(result)
+# writeRaster(result, filename="test.tif", overwrite=TRUE)
+
+# Local Polynomial (SLOW)
+# model.lo <- loess(emission ~ building + population, data = data)
+
+# Random Forest
+# em_threshold <- 0.5
+# df_clean <- df %>%
+#   filter(!(building < 0.001 & emission > em_threshold))
+
+# Then train on the cleaned data
+df_rf <- df[sample(nrow(df), nrow(df)/10), ]
+
+
+model.rf <- randomForest(emission ~ .,  data=df_rf)
+pred <- predict(model.rf, variables)
+```
+
+```{r}
+result <- rast(matrix(pred, ncol = ncol(landres_nor), byrow = TRUE), ext = ext(landres_nor), crs = crs(landres_nor))
+ext(result) <- ext(landres_nor)
+crs(result) <- crs(landres_nor)
+plot(result)
+
+print(global(result, "sum", na.rm = TRUE))
+```
+
+```{r}
+plot(city_mask)
+result_cropped <- crop(result, city_mask)
+result_cropped <- mask(result_cropped, city_mask, updatevalue = NA)
+
+# Resample landcover to match result_cropped
+landcover_mask <- resample(landcover, result_cropped, method = "near")
+values(landcover_mask) <- ifelse(values(landcover_mask) > 1, 1, 0)
+
+# Apply the landcover mask
+result_masked <- result_cropped * landcover_mask
+
+# total_emissions <- 895867
+# scaling_factor <- total_emissions/global(result_cropped, "sum", na.rm = TRUE)[[1]]
+# 
+# result_cropped <- scaling_factor*result_cropped
+
+plot(result_masked)
+print(global(result_masked, "sum", na.rm = TRUE))
+
+```
+
+```{r}
+writeRaster(result_masked,res_string, overwrite=TRUE)                       
+print(name_vec)
+
+```
+
